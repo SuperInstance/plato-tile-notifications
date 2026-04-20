@@ -1,87 +1,169 @@
-"""Event-driven tile notification system."""
+"""Tile notifications — delivery channels, templates, batching, and preferences."""
 import time
 from dataclasses import dataclass, field
-from enum import Enum
+from typing import Optional, Callable
 from collections import defaultdict
+from enum import Enum
 
-class NotificationType(Enum):
-    TILE_CREATED = "tile_created"
-    TILE_UPDATED = "tile_updated"
-    TILE_GHOSTED = "tile_ghosted"
-    TILE_RESURRECTED = "tile_resurrected"
-    TILE_DELETED = "tile_deleted"
-    TILE_SCORED = "tile_scored"
-    TILE_PROMOTED = "tile_promoted"
-    TILE_FLAGGED = "tile_flagged"
-    ROOM_CHANGE = "room_change"
+class Channel(Enum):
+    IN_APP = "in_app"
+    WEBHOOK = "webhook"
+    LOG = "log"
+    CALLBACK = "callback"
+    DIGEST = "digest"
+
+class Priority(Enum):
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+    URGENT = "urgent"
 
 @dataclass
 class Notification:
-    ntype: NotificationType
-    tile_id: str
-    message: str
-    source: str = ""
-    timestamp: float = field(default_factory=time.time)
+    id: str
+    recipient: str
+    title: str
+    body: str
+    channel: Channel = Channel.IN_APP
+    priority: Priority = Priority.NORMAL
+    tile_id: str = ""
+    room: str = ""
     read: bool = False
-    priority: int = 0
+    delivered: bool = False
+    delivered_at: float = 0.0
+    created_at: float = field(default_factory=time.time)
+    metadata: dict = field(default_factory=dict)
 
-class TileNotifications:
-    def __init__(self, max_notifications: int = 500):
-        self.max = max_notifications
-        self._inbox: list[Notification] = []
-        self._subscriptions: dict[str, set[NotificationType]] = defaultdict(set)
-        self._handlers: dict[str, list] = defaultdict(list)
+@dataclass
+class DeliveryPreference:
+    agent: str
+    channels: list[Channel] = field(default_factory=lambda: [Channel.IN_APP])
+    min_priority: Priority = Priority.LOW
+    quiet_hours_start: int = 23  # 11pm
+    quiet_hours_end: int = 8     # 8am
+    digest_enabled: bool = True
+    digest_interval: float = 3600.0
 
-    def subscribe(self, agent: str, ntypes: list[str] = None):
-        if ntypes:
-            for nt in ntypes:
-                self._subscriptions[agent].add(NotificationType(nt))
-        else:
-            self._subscriptions[agent] = set(NotificationType)
+class NotificationSystem:
+    def __init__(self):
+        self._inbox: dict[str, list[Notification]] = defaultdict(list)
+        self._digest_queue: dict[str, list[Notification]] = defaultdict(list)
+        self._preferences: dict[str, DeliveryPreference] = {}
+        self._templates: dict[str, str] = {}
+        self._handlers: dict[str, Callable] = {}
+        self._delivery_log: list[dict] = []
+        self._notif_counter: int = 0
 
-    def unsubscribe(self, agent: str):
-        self._subscriptions.pop(agent, None)
-
-    def on(self, ntype: str, handler):
-        self._handlers[ntype].append(handler)
-
-    def emit(self, ntype: str, tile_id: str, message: str, source: str = "", priority: int = 0) -> Notification:
-        notif = Notification(ntype=NotificationType(ntype), tile_id=tile_id,
-                           message=message, source=source, priority=priority)
-        self._inbox.append(notif)
-        if len(self._inbox) > self.max:
-            self._inbox = self._inbox[-self.max:]
-        for handler in self._handlers.get(ntype, []):
+    def send(self, recipient: str, title: str, body: str, channel: str = "in_app",
+             priority: str = "normal", tile_id: str = "", room: str = "",
+             metadata: dict = None) -> Notification:
+        self._notif_counter += 1
+        notif = Notification(id=f"n-{self._notif_counter}", recipient=recipient,
+                           title=title, body=body, channel=Channel(channel),
+                           priority=Priority(priority), tile_id=tile_id, room=room,
+                           metadata=metadata or {})
+        # Check preferences
+        pref = self._preferences.get(recipient)
+        if pref:
+            hour = time.localtime().time().hour
+            if pref.quiet_hours_end <= hour < pref.quiet_hours_start:
+                if pref.digest_enabled:
+                    self._digest_queue[recipient].append(notif)
+                    return notif
+            if pref.channels and Channel(channel) not in pref.channels:
+                notif.delivered = False
+                self._inbox[recipient].append(notif)
+                return notif
+        # Deliver
+        notif.delivered = True
+        notif.delivered_at = time.time()
+        self._inbox[recipient].append(notif)
+        if len(self._inbox[recipient]) > 500:
+            self._inbox[recipient] = self._inbox[recipient][-500:]
+        # Run handler
+        handler = self._handlers.get(channel)
+        if handler:
             try:
                 handler(notif)
             except Exception:
                 pass
+        self._delivery_log.append({"id": notif.id, "recipient": recipient,
+                                   "channel": channel, "priority": priority,
+                                   "delivered": notif.delivered, "timestamp": time.time()})
+        if len(self._delivery_log) > 2000:
+            self._delivery_log = self._delivery_log[-2000:]
         return notif
 
-    def for_agent(self, agent: str, unread_only: bool = True, limit: int = 50) -> list[Notification]:
-        subscribed = self._subscriptions.get(agent, set())
-        if not subscribed:
-            return []
-        results = [n for n in self._inbox if n.ntype in subscribed]
+    def send_template(self, recipient: str, template_name: str, context: dict,
+                      **kwargs) -> Optional[Notification]:
+        template = self._templates.get(template_name)
+        if not template:
+            return None
+        title = template.get("title", "").format(**context)
+        body = template.get("body", "").format(**context)
+        return self.send(recipient, title, body,
+                        channel=kwargs.get("channel", template.get("channel", "in_app")),
+                        priority=kwargs.get("priority", template.get("priority", "normal")),
+                        **kwargs)
+
+    def register_template(self, name: str, title: str, body: str,
+                          channel: str = "in_app", priority: str = "normal"):
+        self._templates[name] = {"title": title, "body": body,
+                                "channel": channel, "priority": priority}
+
+    def register_handler(self, channel: str, fn: Callable):
+        self._handlers[channel] = fn
+
+    def set_preference(self, agent: str, channels: list[str] = None,
+                       min_priority: str = "low", quiet_start: int = 23,
+                       quiet_end: int = 8, digest: bool = True):
+        self._preferences[agent] = DeliveryPreference(
+            agent=agent,
+            channels=[Channel(c) for c in channels] if channels else [Channel.IN_APP],
+            min_priority=Priority(min_priority),
+            quiet_hours_start=quiet_start, quiet_hours_end=quiet_end,
+            digest_enabled=digest)
+
+    def inbox(self, recipient: str, unread_only: bool = False,
+              limit: int = 50) -> list[Notification]:
+        msgs = self._inbox.get(recipient, [])
         if unread_only:
-            results = [n for n in results if not n.read]
-        results.sort(key=lambda n: (n.priority, n.timestamp), reverse=True)
-        return results[:limit]
+            msgs = [m for m in msgs if not m.read]
+        return list(reversed(msgs))[:limit]
 
-    def mark_read(self, tile_id: str = "", ntype: str = ""):
-        for n in self._inbox:
-            if (not tile_id or n.tile_id == tile_id) and (not ntype or n.ntype.value == ntype):
+    def mark_read(self, recipient: str, notification_id: str) -> bool:
+        for n in self._inbox.get(recipient, []):
+            if n.id == notification_id:
                 n.read = True
+                return True
+        return False
 
-    def unread_count(self, agent: str) -> int:
-        return len(self.for_agent(agent, unread_only=True, limit=1000))
+    def mark_all_read(self, recipient: str) -> int:
+        count = 0
+        for n in self._inbox.get(recipient, []):
+            if not n.read:
+                n.read = True
+                count += 1
+        return count
+
+    def flush_digest(self, recipient: str) -> list[Notification]:
+        pending = self._digest_queue.pop(recipient, [])
+        results = []
+        for n in pending:
+            n.delivered = True
+            n.delivered_at = time.time()
+            self._inbox[recipient].append(n)
+            results.append(n)
+        return results
+
+    def unread_count(self, recipient: str) -> int:
+        return sum(1 for n in self._inbox.get(recipient, []) if not n.read)
 
     @property
     def stats(self) -> dict:
-        types = defaultdict(int)
-        for n in self._inbox:
-            types[n.ntype.value] += 1
-        return {"total": len(self._inbox),
-                "unread": sum(1 for n in self._inbox if not n.read),
-                "subscribers": len(self._subscriptions),
-                "types": dict(types)}
+        total_inbox = sum(len(v) for v in self._inbox.values())
+        unread = sum(sum(1 for n in v if not n.read) for v in self._inbox.values())
+        return {"notifications": self._notif_counter, "inbox_size": total_inbox,
+                "unread": unread, "templates": len(self._templates),
+                "preferences": len(self._preferences),
+                "pending_digests": sum(len(v) for v in self._digest_queue.values())}
