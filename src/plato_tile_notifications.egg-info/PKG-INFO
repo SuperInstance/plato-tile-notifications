@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: plato-tile-notifications
+Version: 0.1.0
+Summary: Event-driven tile notification system with subscriptions and handlers
+License: MIT
+Requires-Python: >=3.8
